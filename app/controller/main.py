@@ -1,56 +1,52 @@
-import os
 import logging
-import redis.asyncio as redis
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from ypy_websocket import RedisRoom
-from ypy_websocket.asgiprovider import WebSocketsProvider
+from ypy_websocket import WebsocketServer
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
+class FastAPIWebsocketAdapter:
+    """Adapter wrapping a FastAPI WebSocket to the ypy_websocket Websocket protocol."""
 
-class RedisRoomManager:
-    """
-    Manages Redis rooms for Yjs document synchronization.
-    Each workspace gets its own Redis room for broadcasting Yjs updates.
-    """
-    def __init__(self, redis_url: str):
-        self.redis_url = redis_url
-        self.redis_client = None
+    def __init__(self, websocket: WebSocket, room_name: str):
+        self._websocket = websocket
+        self._room_name = room_name
 
-    async def start(self):
-        """Initialize Redis connection pool on startup."""
-        self.redis_client = await redis.from_url(self.redis_url)
-        logger.info(f"Connected to Redis at {self.redis_url}")
+    @property
+    def path(self) -> str:
+        return self._room_name
 
-    async def stop(self):
-        """Close Redis connection pool on shutdown."""
-        if self.redis_client:
-            await self.redis_client.close()
-            logger.info("Disconnected from Redis")
+    def __aiter__(self):
+        return self
 
-    def get_room(self, room_name: str) -> RedisRoom:
-        """
-        Get or create a Redis room for the given workspace ID.
-        Each workspace gets isolated Yjs document collaboration.
-        """
-        return RedisRoom(self.redis_client, room_name)
+    async def __anext__(self) -> bytes:
+        try:
+            return await self._websocket.receive_bytes()
+        except WebSocketDisconnect:
+            raise StopAsyncIteration()
+        except Exception:
+            raise StopAsyncIteration()
+
+    async def send(self, message: bytes) -> None:
+        await self._websocket.send_bytes(message)
+
+    async def recv(self) -> bytes:
+        return await self._websocket.receive_bytes()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    FastAPI lifespan event handler for managing Redis connection lifecycle.
-    Initializes RedisRoomManager on startup and cleans up on shutdown.
+    FastAPI lifespan event handler for Yjs room lifecycle.
+    Initializes a ypy_websocket WebsocketServer on startup and cleans it up on shutdown.
     """
-    room_manager = RedisRoomManager(REDIS_URL)
-    await room_manager.start()
-    app.state.room_manager = room_manager
-    yield
-    await room_manager.stop()
+    room_manager = WebsocketServer()
+    async with room_manager:
+        app.state.room_manager = room_manager
+        yield
 
 
 # Initialize FastAPI app with lifespan handler
@@ -65,45 +61,28 @@ async def health():
 async def websocket_endpoint(websocket: WebSocket, workspace_id: str):
     """
     WebSocket endpoint for collaborative editing sessions.
-    
+
     Each workspace_id corresponds to a separate Yjs document.
-    Binary Yjs delta states flow through Redis:
-      1. Client sends binary update via WebSocket
-      2. WebSocketsProvider publishes update to Redis channel for workspace_id
-      3. Redis publishes to all subscribers of that channel
-      4. WebSocketsProvider delivers updates to all connected clients
-      5. Clients apply updates to their local Yjs document (CRDT)
-    
+
     Connection lifecycle:
       - Accept WebSocket connection
-      - Get RedisRoom for workspace_id
-      - Wrap connection in WebSocketsProvider for Yjs sync
+      - Get or create a Yjs room for workspace_id
+      - Bridge the FastAPI WebSocket to the ypy_websocket room
       - Keep connection alive until client disconnects
       - Cleanly handle disconnects to prevent log spam
     """
     await websocket.accept()
     room_manager = websocket.app.state.room_manager
-    
+
     try:
-        # Get Redis room for this workspace (creates if new)
-        room = room_manager.get_room(workspace_id)
-        
-        # Bridge WebSocket events to Yjs document via Redis
-        async with WebSocketsProvider(websocket, room) as provider:
-            # Keep connection alive and handle incoming messages
-            # WebSocketsProvider handles Yjs sync internally
-            try:
-                while True:
-                    await websocket.receive_text()
-            except WebSocketDisconnect:
-                pass
+        room = await room_manager.get_room(workspace_id)
+        adapter = FastAPIWebsocketAdapter(websocket, workspace_id)
+        await room.serve(adapter)
     except WebSocketDisconnect:
-        # Handle disconnect during connection acceptance
-        logger.info(f"WebSocket disconnected during acceptance: {workspace_id}")
+        logger.info(f"WebSocket disconnected: {workspace_id}")
     except Exception as e:
         logger.error(f"WebSocket error for workspace {workspace_id}: {str(e)}")
     finally:
-        # Ensure clean disconnection
         try:
             await websocket.close()
         except Exception:
