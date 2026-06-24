@@ -18,6 +18,14 @@ logger = logging.getLogger(__name__)
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 
+def workspace_files_key(workspace_id: str) -> str:
+    return f"workspace:{workspace_id}:files"
+
+
+def file_store_key(workspace_id: str, file_id: str) -> str:
+    return f"yjs:{workspace_id}:{file_id}"
+
+
 class RedisYStore(BaseYStore):
     """A Redis-backed Yjs update store."""
 
@@ -58,7 +66,7 @@ class RedisWebsocketServer(WebsocketServer):
         self.redis = redis_client
 
     def _make_store(self, room_name: str) -> RedisYStore:
-        return RedisYStore(self.redis, f"yjs:{room_name}")
+        return RedisYStore(self.redis, file_store_key(*room_name.split(':', 1)) if ':' in room_name else f"yjs:{room_name}")
 
     async def get_room(self, name: str) -> YRoom:
         if name not in self.rooms:
@@ -71,6 +79,17 @@ class RedisWebsocketServer(WebsocketServer):
         room = self.rooms[name]
         await self.start_room(room)
         return room
+
+    async def list_files(self, workspace_id: str) -> list[str]:
+        items = await self.redis.smembers(workspace_files_key(workspace_id))
+        return [item.decode() if isinstance(item, bytes) else item for item in items]
+
+    async def add_file(self, workspace_id: str, file_id: str) -> None:
+        await self.redis.sadd(workspace_files_key(workspace_id), file_id)
+
+    async def remove_file(self, workspace_id: str, file_id: str) -> None:
+        await self.redis.srem(workspace_files_key(workspace_id), file_id)
+        await self.redis.delete(file_store_key(workspace_id, file_id))
 
 
 class FastAPIWebsocketAdapter:
@@ -120,6 +139,52 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/workspace/{workspace_id}/files")
+async def list_workspace_files(workspace_id: str):
+    room_manager = app.state.room_manager
+    return {"files": await room_manager.list_files(workspace_id)}
+
+
+@app.post("/workspace/{workspace_id}/files")
+async def create_workspace_file(workspace_id: str, payload: dict):
+    file_id = payload.get("file_id")
+    if not file_id:
+        return {"error": "file_id is required"}
+    room_manager = app.state.room_manager
+    await room_manager.add_file(workspace_id, file_id)
+    return {"workspace_id": workspace_id, "file_id": file_id}
+
+
+@app.delete("/workspace/{workspace_id}/files/{file_id:path}")
+async def delete_workspace_file(workspace_id: str, file_id: str):
+    room_manager = app.state.room_manager
+    await room_manager.remove_file(workspace_id, file_id)
+    return {"workspace_id": workspace_id, "file_id": file_id, "deleted": True}
+
+
+@app.websocket("/ws/{workspace_id}/{file_id:path}")
+async def websocket_file_endpoint(websocket: WebSocket, workspace_id: str, file_id: str):
+    """WebSocket endpoint for collaborative editing on a specific workspace file."""
+    await websocket.accept()
+    room_manager = websocket.app.state.room_manager
+    room_name = f"{workspace_id}:{file_id}"
+
+    try:
+        await room_manager.add_file(workspace_id, file_id)
+        room = await room_manager.get_room(room_name)
+        adapter = FastAPIWebsocketAdapter(websocket, room_name)
+        await room.serve(adapter)
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected: {room_name}")
+    except Exception as e:
+        logger.error(f"WebSocket error for room {room_name}: {str(e)}")
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 @app.websocket("/ws/{workspace_id}")
