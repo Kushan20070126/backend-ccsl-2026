@@ -6,7 +6,10 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.138.0",
+    "redis>=8.0.1",
     "uvicorn[standard]>=0.49.0",
+    "y-py>=0.6.2",
+    "ypy-websocket>=0.12.4",
 ]
 
 [project.scripts]
