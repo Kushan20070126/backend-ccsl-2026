@@ -3,23 +3,35 @@ import os
 import struct
 import time
 import json
+import secrets
 from contextlib import asynccontextmanager
+from typing import Dict, Any
+
+from dotenv import load_dotenv
+load_dotenv()
 
 import redis.asyncio as redis
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from websockets.exceptions import ConnectionClosed, ConnectionClosedError, ConnectionClosedOK
+from motor.motor_asyncio import AsyncIOMotorClient
+from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 from ypy_websocket import WebsocketServer
 from ypy_websocket.yroom import YRoom
 from ypy_websocket.ystore import BaseYStore, YDocNotFound
 from ypy_websocket.yutils import Decoder, write_var_uint
 
+# Logging Configuration
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Redis Env Variables
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 REDIS_MAX_CONNECTIONS = int(os.getenv("REDIS_MAX_CONNECTIONS", "20"))
 REDIS_SINGLE_CONNECTION = os.getenv("REDIS_SINGLE_CONNECTION", "true").lower() in ("1", "true", "yes")
+
+# MongoDB Env Variables
+MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://admin@localhost:27017/?authSource=admin")
+DATABASE_NAME = os.getenv("DATABASE_NAME", "collab_editor")
 
 
 def workspace_files_key(workspace_id: str) -> str:
@@ -31,7 +43,7 @@ def file_store_key(workspace_id: str, file_id: str) -> str:
 
 
 class RedisYStore(BaseYStore):
-    """A Redis-backed Yjs update store."""
+    """A Redis-backed Yjs update cache store."""
 
     def __init__(self, redis_client: redis.Redis, key: str, metadata_callback=None, log=None):
         self.redis = redis_client
@@ -63,7 +75,7 @@ class RedisYStore(BaseYStore):
 
 
 class RedisWebsocketServer(WebsocketServer):
-    """WebsocketServer that creates YRooms with Redis persistence."""
+    """WebsocketServer that creates YRooms with Redis persistence cache."""
 
     def __init__(self, redis_client: redis.Redis, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -80,19 +92,11 @@ class RedisWebsocketServer(WebsocketServer):
             except YDocNotFound:
                 pass
             self.rooms[name] = room
-            # FIX 1: start_room() එක call කළ යුත්තේ room එක අලුතින්ම හැදෙන විට (if block එක ඇතුලේ) පමණි.
-            # නැතහොත් හැම websocket connection එකකටම අලුත් background persistence tasks බිහි වී conflict ඇතිවේ.
             await self.start_room(room)
         return self.rooms[name]
 
-    async def list_files(self, workspace_id: str) -> list[str]:
-        items = await self.redis.smembers(workspace_files_key(workspace_id))
-        return [item.decode() if isinstance(item, bytes) else item for item in items]
-
-    async def add_file(self, workspace_id: str, file_id: str) -> None:
-        await self.redis.sadd(workspace_files_key(workspace_id), file_id)
-
     async def remove_file(self, workspace_id: str, file_id: str) -> None:
+        """Removes the file key from Redis cache."""
         await self.redis.srem(workspace_files_key(workspace_id), file_id)
         await self.redis.delete(file_store_key(workspace_id, file_id))
 
@@ -123,12 +127,8 @@ class FastAPIWebsocketAdapter:
         try:
             await self._websocket.send_bytes(message)
         except (WebSocketDisconnect, RuntimeError):
-            # Client already disconnected or socket already closed.
-            # Swallow this to avoid canceling the room broadcast task group.
             return
         except Exception:
-            # Ignore websocket send errors during broadcast; the client will be cleaned up
-            # when receive_bytes eventually fails or the task exits.
             return
 
     async def recv(self) -> bytes:
@@ -140,9 +140,11 @@ class FastAPIWebsocketAdapter:
             raise ConnectionClosedError(None, None) from exc
 
 
+# Lifespan context to handle both Redis and MongoDB
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize Redis and the persistent Yjs WebSocket server."""
+    """Initialize Redis and MongoDB connections."""
+    logger.info("Connecting to Redis...")
     redis_client = await redis.from_url(
         REDIS_URL,
         max_connections=REDIS_MAX_CONNECTIONS,
@@ -151,12 +153,22 @@ async def lifespan(app: FastAPI):
         socket_timeout=5,
         socket_connect_timeout=5,
     )
+    
+    logger.info("Connecting to MongoDB...")
+    mongo_client = AsyncIOMotorClient(MONGODB_URL)
+    
     room_manager = RedisWebsocketServer(redis_client)
+    
     async with room_manager:
         app.state.redis = redis_client
+        app.state.mongo_client = mongo_client
+        app.state.db = mongo_client[DATABASE_NAME]
         app.state.room_manager = room_manager
         yield
+        
     await redis_client.aclose()
+    mongo_client.close()
+    logger.info("Connections closed.")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -169,102 +181,163 @@ app.add_middleware(
 )
 
 
+# Helper function to check passcode for private workspaces
+async def verify_workspace_access(workspace_id: str, passcode: str = None) -> Dict[str, Any]:
+    db = app.state.db
+    workspace = await db.workspaces.find_one({"workspace_id": workspace_id})
+    
+    if not workspace:
+        # Auto-create as public if it doesn't exist
+        workspace = {
+            "workspace_id": workspace_id,
+            "name": workspace_id,
+            "type": "public",
+            "passcode": "",
+            "created_at": time.time()
+        }
+        await db.workspaces.insert_one(workspace)
+        return workspace
+
+    if workspace.get("type") == "private":
+        expected_passcode = workspace.get("passcode")
+        if not passcode or passcode != expected_passcode:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access Denied: Private Workspace requires a valid passcode."
+            )
+            
+    return workspace
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "redis": "connected", "mongodb": "connected"}
+
+
+@app.post("/workspace")
+async def create_workspace(payload: dict):
+    """Creates a room in MongoDB. Generates passcode for private rooms."""
+    db = app.state.db
+    workspace_id = payload.get("workspace_id")
+    name = payload.get("name") or workspace_id
+    room_type = payload.get("type", "public").lower() # "public" or "private"
+    
+    if not workspace_id:
+        raise HTTPException(status_code=400, detail="workspace_id is required")
+
+    # Check if already exists
+    existing = await db.workspaces.find_one({"workspace_id": workspace_id})
+    if existing:
+        return existing
+
+    # Generate random passcode for private room
+    passcode = ""
+    if room_type == "private":
+        passcode = "sec-" + secrets.token_hex(6) # e.g. sec-f5b28a9c1e3d
+        
+    workspace_data = {
+        "workspace_id": workspace_id,
+        "name": name,
+        "type": room_type,
+        "passcode": passcode,
+        "created_at": time.time()
+    }
+    
+    await db.workspaces.insert_one(workspace_data)
+    workspace_data.pop("_id", None)
+    return workspace_data
 
 
 @app.get("/workspace/{workspace_id}/files")
-async def list_workspace_files(workspace_id: str):
-    room_manager = app.state.room_manager
-    redis_client = room_manager.redis
+async def list_workspace_files(workspace_id: str, passcode: str = None):
+    """Lists workspace files from MongoDB after validating passcode."""
+    await verify_workspace_access(workspace_id, passcode)
+    db = app.state.db
     
-  
-    file_ids = await room_manager.list_files(workspace_id)
+    cursor = db.files.find({"workspace_id": workspace_id})
+    files = await cursor.to_list(length=None)
     
-    files = []
-    for file_id in file_ids:
-        metadata_key = f"workspace:{workspace_id}:file:{file_id}:metadata"
-        raw_metadata = await redis_client.get(metadata_key)
-        if raw_metadata:
-            try:
-                files.append(json.loads(raw_metadata.decode() if isinstance(raw_metadata, bytes) else raw_metadata))
-            except Exception:
-                files.append({
-                    "id": file_id,
-                    "name": file_id.split('/')[-1],
-                    "path": file_id,
-                    "content": "",
-                    "language": "typescript"
-                })
-        else:
-            files.append({
-                "id": file_id,
-                "name": file_id.split('/')[-1],
-                "path": file_id,
-                "content": "",
-                "language": "typescript"
-            })
+    for file in files:
+        file.pop("_id", None)
+        
     return files
 
 
 @app.post("/workspace/{workspace_id}/files")
-async def create_workspace_file(workspace_id: str, payload: dict):
-
+async def create_workspace_file(workspace_id: str, payload: dict, passcode: str = None):
+    """Registers a file creation in MongoDB and tracks in Redis server."""
+    await verify_workspace_access(workspace_id, passcode)
+    db = app.state.db
+    room_manager = app.state.room_manager
+    
     file_id = payload.get("path") or payload.get("file_id")
     if not file_id:
-        return {"error": "path/file_id is required"}
-        
-    room_manager = app.state.room_manager
-    redis_client = room_manager.redis
-    
-    await room_manager.add_file(workspace_id, file_id)
-    
-   
+        raise HTTPException(status_code=400, detail="path/file_id is required")
+
+    # Track file in Redis set (backwards compatible)
+    await room_manager.redis.sadd(workspace_files_key(workspace_id), file_id)
+
     file_data = {
+        "workspace_id": workspace_id,
         "id": file_id,
         "name": payload.get("name") or file_id.split('/')[-1],
         "path": file_id,
         "content": payload.get("content") or "",
-        "language": payload.get("language") or "typescript"
+        "language": payload.get("language") or "typescript",
+        "updated_at": time.time()
     }
     
-    metadata_key = f"workspace:{workspace_id}:file:{file_id}:metadata"
-    await redis_client.set(metadata_key, json.dumps(file_data))
+    # Save metadata to MongoDB
+    await db.files.update_one(
+        {"workspace_id": workspace_id, "path": file_id},
+        {"$set": file_data},
+        upsert=True
+    )
     
+    file_data.pop("_id", None)
     return file_data
 
 
 @app.delete("/workspace/{workspace_id}/files/{file_id:path}")
-async def delete_workspace_file(workspace_id: str, file_id: str):
+async def delete_workspace_file(workspace_id: str, file_id: str, passcode: str = None):
+    """Deletes the file metadata from MongoDB and clears Redis updates."""
+    await verify_workspace_access(workspace_id, passcode)
+    db = app.state.db
     room_manager = app.state.room_manager
-    redis_client = room_manager.redis
     
+    # Delete metadata from MongoDB
+    await db.files.delete_one({"workspace_id": workspace_id, "path": file_id})
+    
+    # Clean cache and file listing in Redis
     await room_manager.remove_file(workspace_id, file_id)
-    
-    # Metadata cleanup
-    metadata_key = f"workspace:{workspace_id}:file:{file_id}:metadata"
-    await redis_client.delete(metadata_key)
     
     return {"workspace_id": workspace_id, "file_id": file_id, "deleted": True}
 
 
 @app.websocket("/ws/{workspace_id}/{file_id:path}")
-async def websocket_file_endpoint(websocket: WebSocket, workspace_id: str, file_id: str):
-    """WebSocket endpoint for collaborative editing on a specific workspace file."""
+async def websocket_file_endpoint(websocket: WebSocket, workspace_id: str, file_id: str, passcode: str = None):
+    """WebSocket endpoint for collaborative file editing synced via Redis cache."""
+    # Check MongoDB room privacy passcode
+    try:
+        await verify_workspace_access(workspace_id, passcode)
+    except HTTPException:
+        await websocket.close(code=3000)
+        return
+
     await websocket.accept()
     room_manager = websocket.app.state.room_manager
     room_name = f"{workspace_id}:{file_id}"
 
     try:
-        await room_manager.add_file(workspace_id, file_id)
+        # Register file creation/track
+        await room_manager.redis.sadd(workspace_files_key(workspace_id), file_id)
         room = await room_manager.get_room(room_name)
         adapter = FastAPIWebsocketAdapter(websocket, room_name)
         await room.serve(adapter)
     except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected: {room_name}")
+        logger.info(f"WebSocket file disconnected: {room_name}")
     except Exception as e:
-        logger.error(f"WebSocket error for room {room_name}: {str(e)}")
+        logger.error(f"WebSocket error on file {room_name}: {str(e)}")
     finally:
         try:
             await websocket.close()
@@ -273,8 +346,15 @@ async def websocket_file_endpoint(websocket: WebSocket, workspace_id: str, file_
 
 
 @app.websocket("/ws/{workspace_id}")
-async def websocket_endpoint(websocket: WebSocket, workspace_id: str):
-    """WebSocket endpoint for collaborative editing sessions."""
+async def websocket_endpoint(websocket: WebSocket, workspace_id: str, passcode: str = None):
+    """WebSocket endpoint for collaborative session signaling & syncing."""
+    # Check MongoDB room privacy passcode
+    try:
+        await verify_workspace_access(workspace_id, passcode)
+    except HTTPException:
+        await websocket.close(code=3000)
+        return
+
     await websocket.accept()
     room_manager = websocket.app.state.room_manager
 
@@ -283,9 +363,9 @@ async def websocket_endpoint(websocket: WebSocket, workspace_id: str):
         adapter = FastAPIWebsocketAdapter(websocket, workspace_id)
         await room.serve(adapter)
     except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected: {workspace_id}")
+        logger.info(f"WebSocket session disconnected: {workspace_id}")
     except Exception as e:
-        logger.error(f"WebSocket error for workspace {workspace_id}: {str(e)}")
+        logger.error(f"WebSocket session error {workspace_id}: {str(e)}")
     finally:
         try:
             await websocket.close()
